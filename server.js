@@ -48,6 +48,12 @@ const MAX_MESSAGES_PER_WINDOW = 8;
 app.use((req, res, next) => {
     const origin = req.headers.origin;
 
+    console.log("CORS check:", {
+    requestOrigin: origin,
+    configuredOrigin: frontendOrigin,
+    method: req.method
+});
+
     res.setHeader("Vary", "Origin");
 
     if (origin && origin !== frontendOrigin) {
