@@ -29,7 +29,7 @@ for (const key of requiredEnv) {
     }
 }
 
-const frontendOrigin = process.env.FRONTEND_ORIGIN.replace(/\/$/, "");
+const frontendOrigin = process.env.FRONTEND_ORIGIN.trim().replace(/\/+$/, "");
 
 const supabase = createClient(
     process.env.SUPABASE_URL,
