@@ -98,25 +98,46 @@ async function removeOldMessages() {
     }
 }
 
+
 async function saveMessage(message) {
     if (message.channelId !== process.env.DISCORD_CHANNEL_ID) return;
     if (message.author.system) return;
-   const attachments = Array.from(message.attachments.values())
-    .filter((attachment) =>
-        attachment.contentType?.startsWith("image/")
-    )
-    .map((attachment) => ({
-        url: attachment.url,
-        name: attachment.name,
-        contentType: attachment.contentType
-    }));
-    sender:
-    message.member?.displayName ||
-    message.author.globalName ||
-    message.author.username,
-content: message.content,
-attachments,
-created_at: message.createdAt.toISOString()
+
+    const attachments = Array.from(message.attachments.values())
+        .filter((attachment) =>
+            attachment.contentType?.startsWith("image/")
+        )
+        .map((attachment) => ({
+            url: attachment.url,
+            name: attachment.name,
+            contentType: attachment.contentType
+        }));
+
+    if (!message.content.trim() && attachments.length === 0) return;
+
+    const { error } = await supabase
+        .from("messages")
+        .upsert(
+            {
+                discord_message_id: message.id,
+                sender:
+                    message.member?.displayName ||
+                    message.author.globalName ||
+                    message.author.username,
+                content: message.content,
+                attachments: attachments,
+                created_at: message.createdAt.toISOString()
+            },
+            { onConflict: "discord_message_id" }
+        );
+
+    if (error) {
+        console.error("Could not save Discord message:", error.message);
+    } else {
+        await removeOldMessages();
+    }
+}
+
 
 if (!message.content.trim() && attachments.length === 0) return;
 
