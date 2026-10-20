@@ -361,4 +361,138 @@ app.post("/login", (req, res) => {
 
     res.json({
         token,
-        expiresAt: new Date(ex
+               expiresAt: new Date(expiresAt).toISOString()
+    });
+});
+
+// Read messages from the last five minutes.
+app.get("/api/messages", requireSession, async (req, res) => {
+    try {
+        await removeOldMessages();
+
+        const cutoff = new Date(
+            Date.now() - 5 * 60 * 1000
+        ).toISOString();
+
+        const { data, error } = await supabase
+            .from("messages")
+            .select("id, sender, content, attachments, created_at")
+            .gte("created_at", cutoff)
+            .order("created_at", { ascending: true })
+            .limit(200);
+
+        if (error) {
+            console.error("Could not read messages:", error.message);
+            return res.status(500).json({
+                error: "Could not load messages"
+            });
+        }
+
+        res.json({ messages: data });
+    } catch (error) {
+        console.error("Message retrieval failed:", error.message);
+        res.status(500).json({
+            error: "Could not load messages"
+        });
+    }
+});
+
+// Send a message to Discord as the bot.
+app.post("/api/messages", requireSession, async (req, res) => {
+    const retryAfter = limitRequests(
+        messageAttempts,
+        req.sessionToken,
+        MAX_MESSAGES_PER_WINDOW,
+        MESSAGE_WINDOW
+    );
+
+    if (retryAfter) {
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            error: "You're sending messages too quickly. Please wait."
+        });
+    }
+
+    const { content } = req.body || {};
+
+    if (typeof content !== "string") {
+        return res.status(400).json({
+            error: "Message text is required"
+        });
+    }
+
+    const trimmed = content.trim();
+
+    if (!trimmed) {
+        return res.status(400).json({
+            error: "Message cannot be empty"
+        });
+    }
+
+    if (trimmed.length > 1500) {
+        return res.status(400).json({
+            error: "Messages must be 1500 characters or fewer"
+        });
+    }
+
+    try {
+        const channel = await discord.channels.fetch(
+            process.env.DISCORD_CHANNEL_ID
+        );
+
+        if (!channel || !channel.isTextBased() || !channel.send) {
+            return res.status(503).json({
+                error: "Discord channel is unavailable"
+            });
+        }
+
+        const sentMessage = await channel.send({
+            content: trimmed,
+            allowedMentions: { parse: [] }
+        });
+
+        // Save immediately, even if the bot's message event is delayed.
+        await saveMessage(sentMessage);
+
+        res.status(201).json({
+            message: {
+                sender: discord.user.username,
+                content: sentMessage.content,
+                attachments: [],
+                created_at: sentMessage.createdAt.toISOString()
+            }
+        });
+    } catch (error) {
+        console.error("Could not send Discord message:", error.message);
+        res.status(500).json({
+            error: "Could not send message to Discord"
+        });
+    }
+});
+
+// Expire old sessions and limiters periodically.
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [token, session] of sessions) {
+        if (now >= session.expiresAt) {
+            sessions.delete(token);
+        }
+    }
+
+    for (const store of [loginAttempts, messageAttempts]) {
+        for (const [key, entry] of store) {
+            if (now >= entry.resetAt) {
+                store.delete(key);
+            }
+        }
+    }
+
+    removeOldMessages().catch((error) => {
+        console.error("Message cleanup failed:", error.message);
+    });
+}, 60 * 1000).unref();
+
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Backend server started on port ${PORT}`);
+});
