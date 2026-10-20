@@ -116,32 +116,72 @@ async function removeOldMessages() {
     }
 }
 
-// Save a Discord message, including image attachments.
+function inferImageContentType(url = "") {
+    const path = url.split(/[?#]/)[0].toLowerCase();
+
+    if (path.endsWith(".gif")) return "image/gif";
+    if (path.endsWith(".png")) return "image/png";
+    if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+    if (path.endsWith(".webp")) return "image/webp";
+    if (path.endsWith(".avif")) return "image/avif";
+
+    return "image/*";
+}
+
+// Save Discord messages, including image attachments and GIF embeds.
 async function saveMessage(message) {
-    if (message.channelId !== process.env.DISCORD_CHANNEL_ID) {
-        return;
-    }
+    if (message.channelId !== process.env.DISCORD_CHANNEL_ID) return;
+    if (message.author.system) return;
 
-    if (message.author.system) {
-        return;
-    }
-
-    const attachments = Array.from(
-        message.attachments.values()
-    )
+    const attachments = Array.from(message.attachments.values())
         .filter((attachment) =>
-            attachment.contentType?.startsWith("image/")
+            attachment.contentType?.toLowerCase().startsWith("image/") ||
+            /\.(gif|png|jpe?g|webp|avif)(?:$|[?#])/i.test(attachment.url || "")
         )
         .map((attachment) => ({
             url: attachment.url,
-            name: attachment.name,
-            contentType: attachment.contentType
+            name: attachment.name || "Image attachment",
+            contentType: attachment.contentType || inferImageContentType(attachment.url)
         }));
 
-    // Ignore messages that contain neither text nor images.
+    for (const embed of message.embeds || []) {
+        const imageUrl =
+            embed.image?.url ||
+            embed.thumbnail?.url ||
+            embed.video?.url;
+
+        if (typeof imageUrl === "string" && imageUrl.startsWith("https://")) {
+            attachments.push({
+                url: imageUrl,
+                name: "Discord GIF or image",
+                contentType: inferImageContentType(imageUrl)
+            });
+        }
+
+        const embedUrl = embed.url;
+
+        if (
+            typeof embedUrl === "string" &&
+            embedUrl.startsWith("https://") &&
+            /(?:klipy|tenor|giphy)/i.test(embedUrl) &&
+            /\.(gif|png|jpe?g|webp)(?:$|[?#])/i.test(embedUrl)
+        ) {
+            attachments.push({
+                url: embedUrl,
+                name: "GIF",
+                contentType: inferImageContentType(embedUrl)
+            });
+        }
+    }
+
+    const uniqueAttachments = [
+        ...new Map(attachments.map((item) => [item.url, item])).values()
+    ];
+
     if (
         !message.content.trim() &&
-        attachments.length === 0
+        uniqueAttachments.length === 0 &&
+        (!message.embeds || message.embeds.length === 0)
     ) {
         return;
     }
@@ -156,19 +196,14 @@ async function saveMessage(message) {
                     message.author.globalName ||
                     message.author.username,
                 content: message.content,
-                attachments: attachments,
+                attachments: uniqueAttachments,
                 created_at: message.createdAt.toISOString()
             },
-            {
-                onConflict: "discord_message_id"
-            }
+            { onConflict: "discord_message_id" }
         );
 
     if (error) {
-        console.error(
-            "Could not save Discord message:",
-            error.message
-        );
+        console.error("Could not save Discord message:", error.message);
     } else {
         await removeOldMessages();
     }
