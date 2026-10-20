@@ -110,6 +110,13 @@ async function saveMessage(message) {
         name: attachment.name,
         contentType: attachment.contentType
     }));
+    sender:
+    message.member?.displayName ||
+    message.author.globalName ||
+    message.author.username,
+content: message.content,
+attachments,
+created_at: message.createdAt.toISOString()
 
 if (!message.content.trim() && attachments.length === 0) return;
 
