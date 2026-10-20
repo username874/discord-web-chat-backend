@@ -101,7 +101,17 @@ async function removeOldMessages() {
 async function saveMessage(message) {
     if (message.channelId !== process.env.DISCORD_CHANNEL_ID) return;
     if (message.author.system) return;
-    if (!message.content.trim()) return;
+   const attachments = Array.from(message.attachments.values())
+    .filter((attachment) =>
+        attachment.contentType?.startsWith("image/")
+    )
+    .map((attachment) => ({
+        url: attachment.url,
+        name: attachment.name,
+        contentType: attachment.contentType
+    }));
+
+if (!message.content.trim() && attachments.length === 0) return;
 
     const { error } = await supabase
         .from("messages")
