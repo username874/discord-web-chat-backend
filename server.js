@@ -186,6 +186,7 @@ async function saveMessage(message) {
         return;
     }
 
+
 const { error } = await supabase
     .from("messages")
     .upsert(
@@ -204,6 +205,13 @@ const { error } = await supabase
         },
         { onConflict: "discord_message_id" }
     );
+
+if (error) {
+    console.error("Could not save Discord message:", error.message);
+} else {
+    await removeOldMessages();
+}
+}
 
 // Rate-limit requests.
 function limitRequests(store, key, max, windowMs) {
@@ -407,7 +415,7 @@ app.get("/api/messages", requireSession, async (req, res) => {
 
         const { data, error } = await supabase
             .from("messages")
-            .select("id, sender, content, attachments, created_at")
+            .select("id, sender, avatar_url, content, attachments, created_at")
             .gte("created_at", cutoff)
             .order("created_at", { ascending: true })
             .limit(200);
