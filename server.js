@@ -186,28 +186,24 @@ async function saveMessage(message) {
         return;
     }
 
-    const { error } = await supabase
-        .from("messages")
-        .upsert(
-            {
-                discord_message_id: message.id,
-                sender:
-                    message.member?.displayName ||
-                    message.author.globalName ||
-                    message.author.username,
-                content: message.content,
-                attachments: uniqueAttachments,
-                created_at: message.createdAt.toISOString()
-            },
-            { onConflict: "discord_message_id" }
-        );
-
-    if (error) {
-        console.error("Could not save Discord message:", error.message);
-    } else {
-        await removeOldMessages();
-    }
-}
+const { error } = await supabase
+    .from("messages")
+    .upsert(
+        {
+            discord_message_id: message.id,
+            sender:
+                message.member?.displayName ||
+                message.author.globalName ||
+                message.author.username,
+            avatar_url: message.author.displayAvatarURL({
+                size: 128
+            }),
+            content: message.content,
+            attachments: uniqueAttachments,
+            created_at: message.createdAt.toISOString()
+        },
+        { onConflict: "discord_message_id" }
+    );
 
 // Rate-limit requests.
 function limitRequests(store, key, max, windowMs) {
