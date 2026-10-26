@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const crypto = require("crypto");
+const multer = require("multer");
 const { Client, GatewayIntentBits } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -45,6 +46,42 @@ const messageAttempts = new Map();
 const SESSION_DURATION = 12 * 60 * 60 * 1000;
 const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
+
+// Image upload settings.
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB (safe under Discord's bot limit)
+const MAX_IMAGES = 4;
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_IMAGE_BYTES, files: MAX_IMAGES }
+});
+
+// Check the real file signature instead of trusting the client's MIME type.
+function detectImageExtension(buf) {
+    if (buf.length < 12) return null;
+    if (buf[0] === 0x89 && buf.toString("ascii", 1, 4) === "PNG") return "png";
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
+    if (buf.toString("ascii", 0, 3) === "GIF") return "gif";
+    if (
+        buf.toString("ascii", 0, 4) === "RIFF" &&
+        buf.toString("ascii", 8, 12) === "WEBP"
+    ) return "webp";
+    return null;
+}
+
+function parseUpload(req, res, next) {
+    upload.array("images", MAX_IMAGES)(req, res, (error) => {
+        if (!error) return next();
+
+        const message = error.code === "LIMIT_FILE_SIZE"
+            ? "Each image must be 8 MB or smaller"
+            : error.code === "LIMIT_UNEXPECTED_FILE" || error.code === "LIMIT_FILE_COUNT"
+                ? `You can attach up to ${MAX_IMAGES} images`
+                : "Upload failed";
+
+        res.status(400).json({ error: message });
+    });
+}
 
 // CORS configuration.
 app.use((req, res, next) => {
@@ -186,31 +223,30 @@ async function saveMessage(message) {
         return;
     }
 
+    const { error } = await supabase
+        .from("messages")
+        .upsert(
+            {
+                discord_message_id: message.id,
+                sender:
+                    message.member?.displayName ||
+                    message.author.globalName ||
+                    message.author.username,
+                avatar_url: message.author.displayAvatarURL({
+                    size: 128
+                }),
+                content: message.content,
+                attachments: uniqueAttachments,
+                created_at: message.createdAt.toISOString()
+            },
+            { onConflict: "discord_message_id" }
+        );
 
-const { error } = await supabase
-    .from("messages")
-    .upsert(
-        {
-            discord_message_id: message.id,
-            sender:
-                message.member?.displayName ||
-                message.author.globalName ||
-                message.author.username,
-            avatar_url: message.author.displayAvatarURL({
-                size: 128
-            }),
-            content: message.content,
-            attachments: uniqueAttachments,
-            created_at: message.createdAt.toISOString()
-        },
-        { onConflict: "discord_message_id" }
-    );
-
-if (error) {
-    console.error("Could not save Discord message:", error.message);
-} else {
-    await removeOldMessages();
-}
+    if (error) {
+        console.error("Could not save Discord message:", error.message);
+    } else {
+        await removeOldMessages();
+    }
 }
 
 // Rate-limit requests.
@@ -400,7 +436,7 @@ app.post("/login", (req, res) => {
 
     res.json({
         token,
-               expiresAt: new Date(expiresAt).toISOString()
+        expiresAt: new Date(expiresAt).toISOString()
     });
 });
 
@@ -436,8 +472,8 @@ app.get("/api/messages", requireSession, async (req, res) => {
     }
 });
 
-// Send a message to Discord as the bot.
-app.post("/api/messages", requireSession, async (req, res) => {
+// Send a message (text and/or images) to Discord as the bot.
+app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
     const retryAfter = limitRequests(
         messageAttempts,
         req.sessionToken,
@@ -452,25 +488,36 @@ app.post("/api/messages", requireSession, async (req, res) => {
         });
     }
 
-    const { content } = req.body || {};
+    const rawContent = req.body?.content;
+    const content = typeof rawContent === "string" ? rawContent.trim() : "";
+    const uploaded = req.files || [];
 
-    if (typeof content !== "string") {
+    if (!content && uploaded.length === 0) {
         return res.status(400).json({
-            error: "Message text is required"
+            error: "Write a message or attach an image"
         });
     }
 
-    const trimmed = content.trim();
-
-    if (!trimmed) {
-        return res.status(400).json({
-            error: "Message cannot be empty"
-        });
-    }
-
-    if (trimmed.length > 1500) {
+    if (content.length > 1500) {
         return res.status(400).json({
             error: "Messages must be 1500 characters or fewer"
+        });
+    }
+
+    const files = [];
+    for (const [i, file] of uploaded.entries()) {
+        const ext = detectImageExtension(file.buffer);
+
+        if (!ext) {
+            return res.status(400).json({
+                error: "Only PNG, JPEG, GIF and WebP images are allowed"
+            });
+        }
+
+        // Never reuse the client's filename.
+        files.push({
+            attachment: file.buffer,
+            name: `image-${Date.now()}-${i}.${ext}`
         });
     }
 
@@ -486,7 +533,8 @@ app.post("/api/messages", requireSession, async (req, res) => {
         }
 
         const sentMessage = await channel.send({
-            content: trimmed,
+            content: content || undefined,
+            files,
             allowedMentions: { parse: [] }
         });
 
@@ -497,7 +545,11 @@ app.post("/api/messages", requireSession, async (req, res) => {
             message: {
                 sender: discord.user.username,
                 content: sentMessage.content,
-                attachments: [],
+                attachments: Array.from(sentMessage.attachments.values()).map((a) => ({
+                    url: a.url,
+                    name: a.name,
+                    contentType: a.contentType
+                })),
                 created_at: sentMessage.createdAt.toISOString()
             }
         });
