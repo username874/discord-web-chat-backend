@@ -3,7 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const crypto = require("crypto");
 const multer = require("multer");
-const { Client, GatewayIntentBits } = require("discord.js");
+const { Client, GatewayIntentBits, Partials } = require("discord.js");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
@@ -42,10 +42,15 @@ const supabase = createClient(
 const sessions = new Map();
 const loginAttempts = new Map();
 const messageAttempts = new Map();
+const memberLookups = new Map();
 
 const SESSION_DURATION = 12 * 60 * 60 * 1000;
 const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
+
+// Direct messages are kept for 24 hours (change this to keep them longer or shorter).
+const DM_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DISCORD_ID_PATTERN = /^\d{17,20}$/;
 
 // Image upload settings.
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB (safe under Discord's bot limit)
@@ -126,12 +131,18 @@ app.use((req, res, next) => {
 });
 
 // Discord bot.
+// GuildMembers is a privileged intent: enable "Server Members Intent" for the
+// bot in the Discord Developer Portal, or the bot will fail to log in.
 const discord = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.DirectMessages
+    ],
+    // Required so the bot receives DM channels it hasn't cached yet.
+    partials: [Partials.Channel]
 });
 
 // Remove messages older than five minutes.
@@ -148,6 +159,25 @@ async function removeOldMessages() {
     if (error) {
         console.error(
             "Could not remove old messages:",
+            error.message
+        );
+    }
+}
+
+// Remove direct messages older than the retention period.
+async function removeOldDms() {
+    const cutoff = new Date(
+        Date.now() - DM_RETENTION_MS
+    ).toISOString();
+
+    const { error } = await supabase
+        .from("dms")
+        .delete()
+        .lt("created_at", cutoff);
+
+    if (error) {
+        console.error(
+            "Could not remove old DMs:",
             error.message
         );
     }
@@ -249,6 +279,62 @@ async function saveMessage(message) {
     }
 }
 
+// The server (guild) that the chat channel belongs to.
+async function getGuild() {
+    const channel = await discord.channels.fetch(
+        process.env.DISCORD_CHANNEL_ID
+    );
+
+    return channel?.guild || null;
+}
+
+// Only people who are members of the server can be messaged.
+async function getGuildMember(userId) {
+    const guild = await getGuild();
+    if (!guild) return null;
+
+    try {
+        return await guild.members.fetch(userId);
+    } catch {
+        return null;
+    }
+}
+
+// Save a DM that someone sent to the bot (only from server members).
+async function saveInboundDm(message) {
+    if (message.author.bot || message.author.system) return;
+
+    const member = await getGuildMember(message.author.id);
+    if (!member) return;
+
+    const content = message.content?.trim()
+        ? message.content
+        : message.attachments.size > 0
+            ? "[sent an attachment]"
+            : "";
+
+    if (!content) return;
+
+    const { error } = await supabase
+        .from("dms")
+        .upsert(
+            {
+                discord_message_id: message.id,
+                discord_user_id: member.id,
+                discord_username: member.displayName,
+                avatar_url: member.displayAvatarURL({ size: 128 }),
+                direction: "in",
+                content,
+                created_at: message.createdAt.toISOString()
+            },
+            { onConflict: "discord_message_id" }
+        );
+
+    if (error) {
+        console.error("Could not save inbound DM:", error.message);
+    }
+}
+
 // Rate-limit requests.
 function limitRequests(store, key, max, windowMs) {
     const now = Date.now();
@@ -347,9 +433,15 @@ discord.once("ready", async () => {
     }
 });
 
-// Save newly created Discord messages.
+// Save newly created Discord messages (channel messages and DMs to the bot).
 discord.on("messageCreate", async (message) => {
     try {
+        // Messages with no server are DMs.
+        if (!message.guildId) {
+            await saveInboundDm(message);
+            return;
+        }
+
         await saveMessage(message);
     } catch (error) {
         console.error(
@@ -561,6 +653,242 @@ app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
     }
 });
 
+// ---------- Direct messages ----------
+
+// Search server members by name, so you can start a DM.
+app.get("/api/members", requireSession, async (req, res) => {
+    const retryAfter = limitRequests(
+        memberLookups,
+        req.sessionToken,
+        30,
+        MESSAGE_WINDOW
+    );
+
+    if (retryAfter) {
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            error: "Searching too quickly. Please wait a moment."
+        });
+    }
+
+    const query = typeof req.query.q === "string"
+        ? req.query.q.trim().slice(0, 32)
+        : "";
+
+    if (!query) {
+        return res.json({ members: [] });
+    }
+
+    try {
+        const guild = await getGuild();
+
+        if (!guild) {
+            return res.status(503).json({
+                error: "Discord server is unavailable"
+            });
+        }
+
+        const found = await guild.members.fetch({ query, limit: 10 });
+
+        const members = Array.from(found.values())
+            .filter((member) => !member.user.bot)
+            .map((member) => ({
+                id: member.id,
+                name: member.displayName,
+                username: member.user.username,
+                avatar_url: member.displayAvatarURL({ size: 64 })
+            }));
+
+        res.json({ members });
+    } catch (error) {
+        console.error("Could not search members:", error.message);
+        res.status(500).json({
+            error: "Could not search members"
+        });
+    }
+});
+
+// List DM conversations (one entry per person, newest first).
+app.get("/api/dms", requireSession, async (req, res) => {
+    try {
+        await removeOldDms();
+
+        const { data, error } = await supabase
+            .from("dms")
+            .select("id, discord_user_id, discord_username, avatar_url, direction, content, created_at")
+            .order("created_at", { ascending: false })
+            .limit(500);
+
+        if (error) {
+            console.error("Could not read DMs:", error.message);
+            return res.status(500).json({
+                error: "Could not load DMs"
+            });
+        }
+
+        const conversations = new Map();
+
+        for (const row of data) {
+            // Rows are newest first, so the first row per person is the latest.
+            if (conversations.has(row.discord_user_id)) continue;
+
+            conversations.set(row.discord_user_id, {
+                user_id: row.discord_user_id,
+                name: row.discord_username,
+                avatar_url: row.avatar_url,
+                last_id: row.id,
+                last_content: row.content,
+                last_direction: row.direction,
+                last_at: row.created_at
+            });
+        }
+
+        res.json({ conversations: Array.from(conversations.values()) });
+    } catch (error) {
+        console.error("DM list failed:", error.message);
+        res.status(500).json({
+            error: "Could not load DMs"
+        });
+    }
+});
+
+// Read one DM conversation.
+app.get("/api/dms/:userId", requireSession, async (req, res) => {
+    const { userId } = req.params;
+
+    if (!DISCORD_ID_PATTERN.test(userId)) {
+        return res.status(400).json({
+            error: "Invalid user"
+        });
+    }
+
+    try {
+        await removeOldDms();
+
+        const { data, error } = await supabase
+            .from("dms")
+            .select("id, direction, content, created_at")
+            .eq("discord_user_id", userId)
+            .order("created_at", { ascending: true })
+            .limit(200);
+
+        if (error) {
+            console.error("Could not read DM thread:", error.message);
+            return res.status(500).json({
+                error: "Could not load this conversation"
+            });
+        }
+
+        res.json({ messages: data });
+    } catch (error) {
+        console.error("DM thread failed:", error.message);
+        res.status(500).json({
+            error: "Could not load this conversation"
+        });
+    }
+});
+
+// Send a DM to a server member as the bot.
+app.post("/api/dms/:userId", requireSession, async (req, res) => {
+    const { userId } = req.params;
+
+    if (!DISCORD_ID_PATTERN.test(userId)) {
+        return res.status(400).json({
+            error: "Invalid user"
+        });
+    }
+
+    const retryAfter = limitRequests(
+        messageAttempts,
+        `dm:${req.sessionToken}`,
+        MAX_MESSAGES_PER_WINDOW,
+        MESSAGE_WINDOW
+    );
+
+    if (retryAfter) {
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            error: "You're sending messages too quickly. Please wait."
+        });
+    }
+
+    const { content } = req.body || {};
+
+    if (typeof content !== "string" || !content.trim()) {
+        return res.status(400).json({
+            error: "Message cannot be empty"
+        });
+    }
+
+    const trimmed = content.trim();
+
+    if (trimmed.length > 1500) {
+        return res.status(400).json({
+            error: "Messages must be 1500 characters or fewer"
+        });
+    }
+
+    try {
+        const member = await getGuildMember(userId);
+
+        if (!member || member.user.bot) {
+            return res.status(404).json({
+                error: "That person isn't in the Discord server"
+            });
+        }
+
+        let sent;
+
+        try {
+            sent = await member.user.send({
+                content: trimmed,
+                allowedMentions: { parse: [] }
+            });
+        } catch (error) {
+            // 50007 = the person doesn't accept DMs from this bot.
+            if (error.code === 50007) {
+                return res.status(403).json({
+                    error: `${member.displayName} has DMs turned off for server members, so the bot can't message them.`
+                });
+            }
+
+            throw error;
+        }
+
+        const { error: dbError } = await supabase
+            .from("dms")
+            .upsert(
+                {
+                    discord_message_id: sent.id,
+                    discord_user_id: member.id,
+                    discord_username: member.displayName,
+                    avatar_url: member.displayAvatarURL({ size: 128 }),
+                    direction: "out",
+                    content: trimmed,
+                    created_at: sent.createdAt.toISOString()
+                },
+                { onConflict: "discord_message_id" }
+            );
+
+        if (dbError) {
+            console.error("Could not save outbound DM:", dbError.message);
+        }
+
+        res.status(201).json({
+            message: {
+                direction: "out",
+                content: trimmed,
+                created_at: sent.createdAt.toISOString()
+            }
+        });
+    } catch (error) {
+        console.error("Could not send DM:", error.message);
+        res.status(500).json({
+            error: "Could not send the DM"
+        });
+    }
+});
+
 // Expire old sessions and limiters periodically.
 setInterval(() => {
     const now = Date.now();
@@ -571,7 +899,7 @@ setInterval(() => {
         }
     }
 
-    for (const store of [loginAttempts, messageAttempts]) {
+    for (const store of [loginAttempts, messageAttempts, memberLookups]) {
         for (const [key, entry] of store) {
             if (now >= entry.resetAt) {
                 store.delete(key);
@@ -581,6 +909,10 @@ setInterval(() => {
 
     removeOldMessages().catch((error) => {
         console.error("Message cleanup failed:", error.message);
+    });
+
+    removeOldDms().catch((error) => {
+        console.error("DM cleanup failed:", error.message);
     });
 }, 60 * 1000).unref();
 
