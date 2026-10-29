@@ -43,14 +43,23 @@ const sessions = new Map();
 const loginAttempts = new Map();
 const messageAttempts = new Map();
 const memberLookups = new Map();
+const pollAttempts = new Map();
+const voteAttempts = new Map();
 
 const SESSION_DURATION = 12 * 60 * 60 * 1000;
 const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
 
 // Direct messages are kept for 24 hours (change this to keep them longer or shorter).
-const DM_RETENTION_MS = 5 * 60 * 60 * 1000;
+const DM_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DISCORD_ID_PATTERN = /^\d{17,20}$/;
+
+// Polls: finished polls stay visible (with final results) for one hour.
+const POLL_RETENTION_MS = 60 * 60 * 1000;
+const POLL_DURATIONS_MINUTES = [5, 30, 60, 360, 1440];
+const POLL_MIN_OPTIONS = 2;
+const POLL_MAX_OPTIONS = 6;
+const VOTER_ID_PATTERN = /^[A-Za-z0-9-]{16,64}$/;
 
 // Image upload settings.
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB (safe under Discord's bot limit)
@@ -178,6 +187,25 @@ async function removeOldDms() {
     if (error) {
         console.error(
             "Could not remove old DMs:",
+            error.message
+        );
+    }
+}
+
+// Remove polls (and, through the cascade, their votes) an hour after they end.
+async function removeOldPolls() {
+    const cutoff = new Date(
+        Date.now() - POLL_RETENTION_MS
+    ).toISOString();
+
+    const { error } = await supabase
+        .from("polls")
+        .delete()
+        .lt("expires_at", cutoff);
+
+    if (error) {
+        console.error(
+            "Could not remove old polls:",
             error.message
         );
     }
@@ -889,6 +917,304 @@ app.post("/api/dms/:userId", requireSession, async (req, res) => {
     }
 });
 
+// ---------- Polls ----------
+
+// List current polls with live results (and which option this voter chose).
+app.get("/api/polls", requireSession, async (req, res) => {
+    const voter =
+        typeof req.query.voter === "string" &&
+        VOTER_ID_PATTERN.test(req.query.voter)
+            ? req.query.voter
+            : "";
+
+    try {
+        await removeOldPolls();
+
+        const { data: polls, error } = await supabase
+            .from("polls")
+            .select("id, question, options, expires_at")
+            .order("created_at", { ascending: false })
+            .limit(20);
+
+        if (error) {
+            console.error("Could not read polls:", error.message);
+            return res.status(500).json({
+                error: "Could not load polls"
+            });
+        }
+
+        if (!polls.length) {
+            return res.json({ polls: [] });
+        }
+
+        const { data: votes, error: voteError } = await supabase
+            .from("poll_votes")
+            .select("poll_id, voter_id, option_index")
+            .in("poll_id", polls.map((poll) => poll.id));
+
+        if (voteError) {
+            console.error("Could not read votes:", voteError.message);
+            return res.status(500).json({
+                error: "Could not load polls"
+            });
+        }
+
+        const now = Date.now();
+
+        const result = polls.map((poll) => {
+            const counts = poll.options.map(() => 0);
+            let myVote = null;
+
+            for (const vote of votes) {
+                if (vote.poll_id !== poll.id) continue;
+
+                if (counts[vote.option_index] !== undefined) {
+                    counts[vote.option_index]++;
+                }
+
+                if (voter && vote.voter_id === voter) {
+                    myVote = vote.option_index;
+                }
+            }
+
+            return {
+                id: poll.id,
+                question: poll.question,
+                options: poll.options,
+                counts,
+                total: counts.reduce((sum, count) => sum + count, 0),
+                my_vote: myVote,
+                expires_at: poll.expires_at,
+                closed: new Date(poll.expires_at).getTime() <= now
+            };
+        });
+
+        res.json({ polls: result });
+    } catch (error) {
+        console.error("Poll retrieval failed:", error.message);
+        res.status(500).json({
+            error: "Could not load polls"
+        });
+    }
+});
+
+// Create a poll and announce it in the Discord channel.
+app.post("/api/polls", requireSession, async (req, res) => {
+    const retryAfter = limitRequests(
+        pollAttempts,
+        req.sessionToken,
+        5,
+        MESSAGE_WINDOW
+    );
+
+    if (retryAfter) {
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            error: "You're creating polls too quickly. Please wait."
+        });
+    }
+
+    const { question, options, minutes } = req.body || {};
+
+    const trimmedQuestion =
+        typeof question === "string" ? question.trim() : "";
+
+    if (!trimmedQuestion || trimmedQuestion.length > 200) {
+        return res.status(400).json({
+            error: "Write a question (200 characters or fewer)"
+        });
+    }
+
+    if (!Array.isArray(options)) {
+        return res.status(400).json({
+            error: "Add some options"
+        });
+    }
+
+    const cleaned = options
+        .filter((option) => typeof option === "string")
+        .map((option) => option.trim())
+        .filter(Boolean);
+
+    if (
+        cleaned.length < POLL_MIN_OPTIONS ||
+        cleaned.length > POLL_MAX_OPTIONS
+    ) {
+        return res.status(400).json({
+            error: `A poll needs ${POLL_MIN_OPTIONS} to ${POLL_MAX_OPTIONS} options`
+        });
+    }
+
+    if (cleaned.some((option) => option.length > 80)) {
+        return res.status(400).json({
+            error: "Each option must be 80 characters or fewer"
+        });
+    }
+
+    const distinct = new Set(cleaned.map((option) => option.toLowerCase()));
+
+    if (distinct.size !== cleaned.length) {
+        return res.status(400).json({
+            error: "Each option must be different"
+        });
+    }
+
+    const duration = POLL_DURATIONS_MINUTES.includes(Number(minutes))
+        ? Number(minutes)
+        : 60;
+
+    try {
+        const { data, error } = await supabase
+            .from("polls")
+            .insert({
+                question: trimmedQuestion,
+                options: cleaned,
+                expires_at: new Date(
+                    Date.now() + duration * 60 * 1000
+                ).toISOString()
+            })
+            .select("id")
+            .single();
+
+        if (error) {
+            console.error("Could not create poll:", error.message);
+            return res.status(500).json({
+                error: "Could not create the poll"
+            });
+        }
+
+        // Let the Discord channel know. A failure here doesn't undo the poll.
+        try {
+            const channel = await discord.channels.fetch(
+                process.env.DISCORD_CHANNEL_ID
+            );
+
+            if (channel && channel.isTextBased() && channel.send) {
+                const lines = cleaned.map(
+                    (option, index) => `${index + 1}. ${option}`
+                );
+
+                const announcement = await channel.send({
+                    content:
+                        `📊 **New poll:** ${trimmedQuestion}\n` +
+                        `${lines.join("\n")}\n` +
+                        "Vote on the website!",
+                    allowedMentions: { parse: [] }
+                });
+
+                await saveMessage(announcement);
+            }
+        } catch (announceError) {
+            console.error(
+                "Could not announce poll:",
+                announceError.message
+            );
+        }
+
+        res.status(201).json({ id: data.id });
+    } catch (error) {
+        console.error("Poll creation failed:", error.message);
+        res.status(500).json({
+            error: "Could not create the poll"
+        });
+    }
+});
+
+// Vote (or change your vote) on a poll.
+app.post("/api/polls/:id/vote", requireSession, async (req, res) => {
+    if (!/^\d{1,15}$/.test(req.params.id)) {
+        return res.status(400).json({
+            error: "Invalid poll"
+        });
+    }
+
+    const pollId = Number(req.params.id);
+
+    const retryAfter = limitRequests(
+        voteAttempts,
+        req.sessionToken,
+        30,
+        MESSAGE_WINDOW
+    );
+
+    if (retryAfter) {
+        res.setHeader("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            error: "You're voting too quickly. Please wait."
+        });
+    }
+
+    const { option, voter_id: voterId } = req.body || {};
+
+    if (
+        typeof voterId !== "string" ||
+        !VOTER_ID_PATTERN.test(voterId) ||
+        !Number.isInteger(option)
+    ) {
+        return res.status(400).json({
+            error: "Invalid vote"
+        });
+    }
+
+    try {
+        const { data: poll, error } = await supabase
+            .from("polls")
+            .select("id, options, expires_at")
+            .eq("id", pollId)
+            .maybeSingle();
+
+        if (error) {
+            console.error("Could not read poll:", error.message);
+            return res.status(500).json({
+                error: "Could not record your vote"
+            });
+        }
+
+        if (!poll) {
+            return res.status(404).json({
+                error: "That poll no longer exists"
+            });
+        }
+
+        if (new Date(poll.expires_at).getTime() <= Date.now()) {
+            return res.status(403).json({
+                error: "This poll has ended"
+            });
+        }
+
+        if (option < 0 || option >= poll.options.length) {
+            return res.status(400).json({
+                error: "Invalid option"
+            });
+        }
+
+        const { error: voteError } = await supabase
+            .from("poll_votes")
+            .upsert(
+                {
+                    poll_id: pollId,
+                    voter_id: voterId,
+                    option_index: option
+                },
+                { onConflict: "poll_id,voter_id" }
+            );
+
+        if (voteError) {
+            console.error("Could not save vote:", voteError.message);
+            return res.status(500).json({
+                error: "Could not record your vote"
+            });
+        }
+
+        res.json({ ok: true });
+    } catch (error) {
+        console.error("Voting failed:", error.message);
+        res.status(500).json({
+            error: "Could not record your vote"
+        });
+    }
+});
+
 // Expire old sessions and limiters periodically.
 setInterval(() => {
     const now = Date.now();
@@ -899,7 +1225,7 @@ setInterval(() => {
         }
     }
 
-    for (const store of [loginAttempts, messageAttempts, memberLookups]) {
+    for (const store of [loginAttempts, messageAttempts, memberLookups, pollAttempts, voteAttempts]) {
         for (const [key, entry] of store) {
             if (now >= entry.resetAt) {
                 store.delete(key);
@@ -913,6 +1239,10 @@ setInterval(() => {
 
     removeOldDms().catch((error) => {
         console.error("DM cleanup failed:", error.message);
+    });
+
+    removeOldPolls().catch((error) => {
+        console.error("Poll cleanup failed:", error.message);
     });
 }, 60 * 1000).unref();
 
