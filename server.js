@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "10kb" }));
 
+// The left side uses the original variables, so nothing changes for it.
 const requiredEnv = [
     "DISCORD_TOKEN",
     "DISCORD_CHANNEL_ID",
@@ -38,28 +39,55 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Temporary in-memory sessions. Sessions expire after 12 hours.
+// Two sides, each with its own bot, password and DM inbox.
+//   left  -> DISCORD_TOKEN        + CHAT_PASSWORD
+//   right -> DISCORD_TOKEN_RIGHT  + CHAT_PASSWORD_RIGHT
+// Both bots must be different Discord applications in the same server.
+const SIDES = ["left", "right"];
+
+const sideConfig = {
+    left: {
+        token: process.env.DISCORD_TOKEN,
+        password: process.env.CHAT_PASSWORD
+    },
+    right: {
+        token: process.env.DISCORD_TOKEN_RIGHT,
+        password: process.env.CHAT_PASSWORD_RIGHT
+    }
+};
+
+sideConfig.left.enabled = true;
+sideConfig.right.enabled = Boolean(
+    sideConfig.right.token && sideConfig.right.password
+);
+
+if (!sideConfig.right.enabled) {
+    console.warn(
+        "Right side is disabled: set DISCORD_TOKEN_RIGHT and CHAT_PASSWORD_RIGHT to turn it on."
+    );
+} else if (sideConfig.right.token === sideConfig.left.token) {
+    console.error(
+        "DISCORD_TOKEN_RIGHT must be a different bot than DISCORD_TOKEN. Right side disabled."
+    );
+    sideConfig.right.enabled = false;
+}
+
+// One Discord client per enabled side.
+const bots = {};
+
+// Temporary in-memory sessions. Sessions expire after 5 hours.
 const sessions = new Map();
 const loginAttempts = new Map();
 const messageAttempts = new Map();
 const memberLookups = new Map();
-const pollAttempts = new Map();
-const voteAttempts = new Map();
 
-const SESSION_DURATION = 12 * 60 * 60 * 1000;
+const SESSION_DURATION = 5 * 60 * 60 * 1000;
 const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
 
-// Direct messages are kept for 24 hours (change this to keep them longer or shorter).
-const DM_RETENTION_MS = 24 * 60 * 60 * 1000;
+// Direct messages are kept for 5 hours (change this to keep them longer or shorter).
+const DM_RETENTION_MS = 5 * 60 * 60 * 1000;
 const DISCORD_ID_PATTERN = /^\d{17,20}$/;
-
-// Polls: finished polls stay visible (with final results) for one hour.
-const POLL_RETENTION_MS = 60 * 60 * 1000;
-const POLL_DURATIONS_MINUTES = [5, 30, 60, 360, 1440];
-const POLL_MIN_OPTIONS = 2;
-const POLL_MAX_OPTIONS = 6;
-const VOTER_ID_PATTERN = /^[A-Za-z0-9-]{16,64}$/;
 
 // Image upload settings.
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB (safe under Discord's bot limit)
@@ -139,25 +167,10 @@ app.use((req, res, next) => {
     next();
 });
 
-// Discord bot.
-// GuildMembers is a privileged intent: enable "Server Members Intent" for the
-// bot in the Discord Developer Portal, or the bot will fail to log in.
-const discord = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.DirectMessages
-    ],
-    // Required so the bot receives DM channels it hasn't cached yet.
-    partials: [Partials.Channel]
-});
-
-// Remove messages older than five minutes.
+// Remove messages older than 30 minutes.
 async function removeOldMessages() {
     const cutoff = new Date(
-        Date.now() - 5 * 60 * 1000
+        Date.now() - 30 * 60 * 1000
     ).toISOString();
 
     const { error } = await supabase
@@ -187,25 +200,6 @@ async function removeOldDms() {
     if (error) {
         console.error(
             "Could not remove old DMs:",
-            error.message
-        );
-    }
-}
-
-// Remove polls (and, through the cascade, their votes) an hour after they end.
-async function removeOldPolls() {
-    const cutoff = new Date(
-        Date.now() - POLL_RETENTION_MS
-    ).toISOString();
-
-    const { error } = await supabase
-        .from("polls")
-        .delete()
-        .lt("expires_at", cutoff);
-
-    if (error) {
-        console.error(
-            "Could not remove old polls:",
             error.message
         );
     }
@@ -307,9 +301,12 @@ async function saveMessage(message) {
     }
 }
 
-// The server (guild) that the chat channel belongs to.
-async function getGuild() {
-    const channel = await discord.channels.fetch(
+// The server (guild) that the chat channel belongs to, as seen by one side's bot.
+async function getGuild(side) {
+    const bot = bots[side];
+    if (!bot) return null;
+
+    const channel = await bot.channels.fetch(
         process.env.DISCORD_CHANNEL_ID
     );
 
@@ -317,8 +314,8 @@ async function getGuild() {
 }
 
 // Only people who are members of the server can be messaged.
-async function getGuildMember(userId) {
-    const guild = await getGuild();
+async function getGuildMember(side, userId) {
+    const guild = await getGuild(side);
     if (!guild) return null;
 
     try {
@@ -328,11 +325,11 @@ async function getGuildMember(userId) {
     }
 }
 
-// Save a DM that someone sent to the bot (only from server members).
-async function saveInboundDm(message) {
+// Save a DM that someone sent to one side's bot (only from server members).
+async function saveInboundDm(message, side) {
     if (message.author.bot || message.author.system) return;
 
-    const member = await getGuildMember(message.author.id);
+    const member = await getGuildMember(side, message.author.id);
     if (!member) return;
 
     const content = message.content?.trim()
@@ -348,6 +345,7 @@ async function saveInboundDm(message) {
         .upsert(
             {
                 discord_message_id: message.id,
+                side,
                 discord_user_id: member.id,
                 discord_username: member.displayName,
                 avatar_url: member.displayAvatarURL({ size: 128 }),
@@ -388,7 +386,7 @@ function limitRequests(store, key, max, windowMs) {
     return 0;
 }
 
-// Require a valid login session.
+// Require a valid login session. Remembers which side logged in.
 function requireSession(req, res, next) {
     const header = req.headers.authorization || "";
     const match = header.match(/^Bearer ([a-f0-9]{64})$/i);
@@ -411,17 +409,15 @@ function requireSession(req, res, next) {
     }
 
     req.sessionToken = token;
+    req.side = session.side;
+    req.bot = bots[session.side];
     next();
 }
 
-// Synchronize recent Discord messages when the bot starts.
-discord.once("ready", async () => {
-    console.log(
-        `Discord bot logged in as ${discord.user.tag}`
-    );
-
+// Catch up on recent channel messages after startup.
+async function syncRecentMessages(client) {
     try {
-        const channel = await discord.channels.fetch(
+        const channel = await client.channels.fetch(
             process.env.DISCORD_CHANNEL_ID
         );
 
@@ -459,39 +455,77 @@ discord.once("ready", async () => {
             error.message
         );
     }
-});
+}
 
-// Save newly created Discord messages (channel messages and DMs to the bot).
-discord.on("messageCreate", async (message) => {
-    try {
-        // Messages with no server are DMs.
-        if (!message.guildId) {
-            await saveInboundDm(message);
-            return;
+// Create and log in one side's bot.
+// GuildMembers is a privileged intent: enable "Server Members Intent" for BOTH
+// bots in the Discord Developer Portal, or the bots will fail to log in.
+function createBot(side) {
+    const client = new Client({
+        intents: [
+            GatewayIntentBits.Guilds,
+            GatewayIntentBits.GuildMessages,
+            GatewayIntentBits.MessageContent,
+            GatewayIntentBits.GuildMembers,
+            GatewayIntentBits.DirectMessages
+        ],
+        // Required so the bot receives DM channels it hasn't cached yet.
+        partials: [Partials.Channel]
+    });
+
+    client.once("ready", async () => {
+        console.log(
+            `Discord ${side} bot logged in as ${client.user.tag}`
+        );
+
+        // The left bot is the one that records the shared channel chat.
+        if (side === "left") {
+            await syncRecentMessages(client);
         }
+    });
 
-        await saveMessage(message);
-    } catch (error) {
+    client.on("messageCreate", async (message) => {
+        try {
+            // Messages with no server are DMs to this side's bot.
+            if (!message.guildId) {
+                await saveInboundDm(message, side);
+                return;
+            }
+
+            // Channel messages only need to be saved once.
+            if (side === "left") {
+                await saveMessage(message);
+            }
+        } catch (error) {
+            console.error(
+                `Message processing failed (${side}):`,
+                error.message
+            );
+        }
+    });
+
+    client.on("error", (error) => {
         console.error(
-            "Message processing failed:",
+            `Discord ${side} client error:`,
             error.message
         );
+    });
+
+    client.login(sideConfig[side].token).catch((error) => {
+        console.error(
+            `Discord ${side} login failed:`,
+            error.message
+        );
+    });
+
+    return client;
+}
+
+for (const side of SIDES) {
+    if (sideConfig[side].enabled) {
+        bots[side] = createBot(side);
     }
-});
-
-discord.on("error", (error) => {
-    console.error(
-        "Discord client error:",
-        error.message
-    );
-});
-
-discord.login(process.env.DISCORD_TOKEN).catch((error) => {
-    console.error(
-        "Discord login failed:",
-        error.message
-    );
-});
+}
 
 // Basic health check.
 app.get("/", (req, res) => {
@@ -501,11 +535,15 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
     res.json({
         status: "ok",
-        discordReady: discord.isReady()
+        discordReady: Boolean(bots.left?.isReady()),
+        sides: {
+            left: Boolean(bots.left?.isReady()),
+            right: Boolean(bots.right?.isReady())
+        }
     });
 });
 
-// Log in with the shared password.
+// Log in to one side with that side's password.
 app.post("/login", (req, res) => {
     const retryAfter = limitRequests(
         loginAttempts,
@@ -522,12 +560,26 @@ app.post("/login", (req, res) => {
         });
     }
 
-    const { password } = req.body || {};
+    const { password, side } = req.body || {};
+
+    if (!SIDES.includes(side)) {
+        return res.status(400).json({
+            error: "Choose the left or right login"
+        });
+    }
+
+    if (!sideConfig[side].enabled || !bots[side]) {
+        return res.status(503).json({
+            error: `The ${side} side isn't set up yet`
+        });
+    }
+
+    const expectedPassword = sideConfig[side].password;
 
     if (
         typeof password !== "string" ||
         password.length > 200 ||
-        password.length !== process.env.CHAT_PASSWORD.length
+        password.length !== expectedPassword.length
     ) {
         return res.status(401).json({
             error: "Incorrect password"
@@ -535,10 +587,7 @@ app.post("/login", (req, res) => {
     }
 
     const supplied = Buffer.from(password, "utf8");
-    const expected = Buffer.from(
-        process.env.CHAT_PASSWORD,
-        "utf8"
-    );
+    const expected = Buffer.from(expectedPassword, "utf8");
 
     if (
         supplied.length !== expected.length ||
@@ -552,10 +601,12 @@ app.post("/login", (req, res) => {
     const token = crypto.randomBytes(32).toString("hex");
     const expiresAt = Date.now() + SESSION_DURATION;
 
-    sessions.set(token, { expiresAt });
+    sessions.set(token, { expiresAt, side });
 
     res.json({
         token,
+        side,
+        name: bots[side].user?.username || "",
         expiresAt: new Date(expiresAt).toISOString()
     });
 });
@@ -592,7 +643,7 @@ app.get("/api/messages", requireSession, async (req, res) => {
     }
 });
 
-// Send a message (text and/or images) to Discord as the bot.
+// Send a message (text and/or images) to Discord as this side's bot.
 app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
     const retryAfter = limitRequests(
         messageAttempts,
@@ -642,7 +693,13 @@ app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
     }
 
     try {
-        const channel = await discord.channels.fetch(
+        if (!req.bot) {
+            return res.status(503).json({
+                error: "Discord bot is unavailable"
+            });
+        }
+
+        const channel = await req.bot.channels.fetch(
             process.env.DISCORD_CHANNEL_ID
         );
 
@@ -663,7 +720,7 @@ app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
 
         res.status(201).json({
             message: {
-                sender: discord.user.username,
+                sender: req.bot.user.username,
                 content: sentMessage.content,
                 attachments: Array.from(sentMessage.attachments.values()).map((a) => ({
                     url: a.url,
@@ -681,7 +738,7 @@ app.post("/api/messages", requireSession, parseUpload, async (req, res) => {
     }
 });
 
-// ---------- Direct messages ----------
+// ---------- Direct messages (each side has its own inbox) ----------
 
 // Search server members by name, so you can start a DM.
 app.get("/api/members", requireSession, async (req, res) => {
@@ -708,7 +765,7 @@ app.get("/api/members", requireSession, async (req, res) => {
     }
 
     try {
-        const guild = await getGuild();
+        const guild = await getGuild(req.side);
 
         if (!guild) {
             return res.status(503).json({
@@ -736,7 +793,7 @@ app.get("/api/members", requireSession, async (req, res) => {
     }
 });
 
-// List DM conversations (one entry per person, newest first).
+// List this side's DM conversations (one entry per person, newest first).
 app.get("/api/dms", requireSession, async (req, res) => {
     try {
         await removeOldDms();
@@ -744,6 +801,7 @@ app.get("/api/dms", requireSession, async (req, res) => {
         const { data, error } = await supabase
             .from("dms")
             .select("id, discord_user_id, discord_username, avatar_url, direction, content, created_at")
+            .eq("side", req.side)
             .order("created_at", { ascending: false })
             .limit(500);
 
@@ -780,7 +838,7 @@ app.get("/api/dms", requireSession, async (req, res) => {
     }
 });
 
-// Read one DM conversation.
+// Read one DM conversation on this side.
 app.get("/api/dms/:userId", requireSession, async (req, res) => {
     const { userId } = req.params;
 
@@ -796,6 +854,7 @@ app.get("/api/dms/:userId", requireSession, async (req, res) => {
         const { data, error } = await supabase
             .from("dms")
             .select("id, direction, content, created_at")
+            .eq("side", req.side)
             .eq("discord_user_id", userId)
             .order("created_at", { ascending: true })
             .limit(200);
@@ -816,7 +875,7 @@ app.get("/api/dms/:userId", requireSession, async (req, res) => {
     }
 });
 
-// Send a DM to a server member as the bot.
+// Send a DM to a server member as this side's bot.
 app.post("/api/dms/:userId", requireSession, async (req, res) => {
     const { userId } = req.params;
 
@@ -857,7 +916,7 @@ app.post("/api/dms/:userId", requireSession, async (req, res) => {
     }
 
     try {
-        const member = await getGuildMember(userId);
+        const member = await getGuildMember(req.side, userId);
 
         if (!member || member.user.bot) {
             return res.status(404).json({
@@ -868,6 +927,7 @@ app.post("/api/dms/:userId", requireSession, async (req, res) => {
         let sent;
 
         try {
+            // The member was fetched by this side's bot, so the DM comes from it.
             sent = await member.user.send({
                 content: trimmed,
                 allowedMentions: { parse: [] }
@@ -888,6 +948,7 @@ app.post("/api/dms/:userId", requireSession, async (req, res) => {
             .upsert(
                 {
                     discord_message_id: sent.id,
+                    side: req.side,
                     discord_user_id: member.id,
                     discord_username: member.displayName,
                     avatar_url: member.displayAvatarURL({ size: 128 }),
@@ -917,304 +978,6 @@ app.post("/api/dms/:userId", requireSession, async (req, res) => {
     }
 });
 
-// ---------- Polls ----------
-
-// List current polls with live results (and which option this voter chose).
-app.get("/api/polls", requireSession, async (req, res) => {
-    const voter =
-        typeof req.query.voter === "string" &&
-        VOTER_ID_PATTERN.test(req.query.voter)
-            ? req.query.voter
-            : "";
-
-    try {
-        await removeOldPolls();
-
-        const { data: polls, error } = await supabase
-            .from("polls")
-            .select("id, question, options, expires_at")
-            .order("created_at", { ascending: false })
-            .limit(20);
-
-        if (error) {
-            console.error("Could not read polls:", error.message);
-            return res.status(500).json({
-                error: "Could not load polls"
-            });
-        }
-
-        if (!polls.length) {
-            return res.json({ polls: [] });
-        }
-
-        const { data: votes, error: voteError } = await supabase
-            .from("poll_votes")
-            .select("poll_id, voter_id, option_index")
-            .in("poll_id", polls.map((poll) => poll.id));
-
-        if (voteError) {
-            console.error("Could not read votes:", voteError.message);
-            return res.status(500).json({
-                error: "Could not load polls"
-            });
-        }
-
-        const now = Date.now();
-
-        const result = polls.map((poll) => {
-            const counts = poll.options.map(() => 0);
-            let myVote = null;
-
-            for (const vote of votes) {
-                if (vote.poll_id !== poll.id) continue;
-
-                if (counts[vote.option_index] !== undefined) {
-                    counts[vote.option_index]++;
-                }
-
-                if (voter && vote.voter_id === voter) {
-                    myVote = vote.option_index;
-                }
-            }
-
-            return {
-                id: poll.id,
-                question: poll.question,
-                options: poll.options,
-                counts,
-                total: counts.reduce((sum, count) => sum + count, 0),
-                my_vote: myVote,
-                expires_at: poll.expires_at,
-                closed: new Date(poll.expires_at).getTime() <= now
-            };
-        });
-
-        res.json({ polls: result });
-    } catch (error) {
-        console.error("Poll retrieval failed:", error.message);
-        res.status(500).json({
-            error: "Could not load polls"
-        });
-    }
-});
-
-// Create a poll and announce it in the Discord channel.
-app.post("/api/polls", requireSession, async (req, res) => {
-    const retryAfter = limitRequests(
-        pollAttempts,
-        req.sessionToken,
-        5,
-        MESSAGE_WINDOW
-    );
-
-    if (retryAfter) {
-        res.setHeader("Retry-After", String(retryAfter));
-        return res.status(429).json({
-            error: "You're creating polls too quickly. Please wait."
-        });
-    }
-
-    const { question, options, minutes } = req.body || {};
-
-    const trimmedQuestion =
-        typeof question === "string" ? question.trim() : "";
-
-    if (!trimmedQuestion || trimmedQuestion.length > 200) {
-        return res.status(400).json({
-            error: "Write a question (200 characters or fewer)"
-        });
-    }
-
-    if (!Array.isArray(options)) {
-        return res.status(400).json({
-            error: "Add some options"
-        });
-    }
-
-    const cleaned = options
-        .filter((option) => typeof option === "string")
-        .map((option) => option.trim())
-        .filter(Boolean);
-
-    if (
-        cleaned.length < POLL_MIN_OPTIONS ||
-        cleaned.length > POLL_MAX_OPTIONS
-    ) {
-        return res.status(400).json({
-            error: `A poll needs ${POLL_MIN_OPTIONS} to ${POLL_MAX_OPTIONS} options`
-        });
-    }
-
-    if (cleaned.some((option) => option.length > 80)) {
-        return res.status(400).json({
-            error: "Each option must be 80 characters or fewer"
-        });
-    }
-
-    const distinct = new Set(cleaned.map((option) => option.toLowerCase()));
-
-    if (distinct.size !== cleaned.length) {
-        return res.status(400).json({
-            error: "Each option must be different"
-        });
-    }
-
-    const duration = POLL_DURATIONS_MINUTES.includes(Number(minutes))
-        ? Number(minutes)
-        : 60;
-
-    try {
-        const { data, error } = await supabase
-            .from("polls")
-            .insert({
-                question: trimmedQuestion,
-                options: cleaned,
-                expires_at: new Date(
-                    Date.now() + duration * 60 * 1000
-                ).toISOString()
-            })
-            .select("id")
-            .single();
-
-        if (error) {
-            console.error("Could not create poll:", error.message);
-            return res.status(500).json({
-                error: "Could not create the poll"
-            });
-        }
-
-        // Let the Discord channel know. A failure here doesn't undo the poll.
-        try {
-            const channel = await discord.channels.fetch(
-                process.env.DISCORD_CHANNEL_ID
-            );
-
-            if (channel && channel.isTextBased() && channel.send) {
-                const lines = cleaned.map(
-                    (option, index) => `${index + 1}. ${option}`
-                );
-
-                const announcement = await channel.send({
-                    content:
-                        `📊 **New poll:** ${trimmedQuestion}\n` +
-                        `${lines.join("\n")}\n` +
-                        "Vote on the website!",
-                    allowedMentions: { parse: [] }
-                });
-
-                await saveMessage(announcement);
-            }
-        } catch (announceError) {
-            console.error(
-                "Could not announce poll:",
-                announceError.message
-            );
-        }
-
-        res.status(201).json({ id: data.id });
-    } catch (error) {
-        console.error("Poll creation failed:", error.message);
-        res.status(500).json({
-            error: "Could not create the poll"
-        });
-    }
-});
-
-// Vote (or change your vote) on a poll.
-app.post("/api/polls/:id/vote", requireSession, async (req, res) => {
-    if (!/^\d{1,15}$/.test(req.params.id)) {
-        return res.status(400).json({
-            error: "Invalid poll"
-        });
-    }
-
-    const pollId = Number(req.params.id);
-
-    const retryAfter = limitRequests(
-        voteAttempts,
-        req.sessionToken,
-        30,
-        MESSAGE_WINDOW
-    );
-
-    if (retryAfter) {
-        res.setHeader("Retry-After", String(retryAfter));
-        return res.status(429).json({
-            error: "You're voting too quickly. Please wait."
-        });
-    }
-
-    const { option, voter_id: voterId } = req.body || {};
-
-    if (
-        typeof voterId !== "string" ||
-        !VOTER_ID_PATTERN.test(voterId) ||
-        !Number.isInteger(option)
-    ) {
-        return res.status(400).json({
-            error: "Invalid vote"
-        });
-    }
-
-    try {
-        const { data: poll, error } = await supabase
-            .from("polls")
-            .select("id, options, expires_at")
-            .eq("id", pollId)
-            .maybeSingle();
-
-        if (error) {
-            console.error("Could not read poll:", error.message);
-            return res.status(500).json({
-                error: "Could not record your vote"
-            });
-        }
-
-        if (!poll) {
-            return res.status(404).json({
-                error: "That poll no longer exists"
-            });
-        }
-
-        if (new Date(poll.expires_at).getTime() <= Date.now()) {
-            return res.status(403).json({
-                error: "This poll has ended"
-            });
-        }
-
-        if (option < 0 || option >= poll.options.length) {
-            return res.status(400).json({
-                error: "Invalid option"
-            });
-        }
-
-        const { error: voteError } = await supabase
-            .from("poll_votes")
-            .upsert(
-                {
-                    poll_id: pollId,
-                    voter_id: voterId,
-                    option_index: option
-                },
-                { onConflict: "poll_id,voter_id" }
-            );
-
-        if (voteError) {
-            console.error("Could not save vote:", voteError.message);
-            return res.status(500).json({
-                error: "Could not record your vote"
-            });
-        }
-
-        res.json({ ok: true });
-    } catch (error) {
-        console.error("Voting failed:", error.message);
-        res.status(500).json({
-            error: "Could not record your vote"
-        });
-    }
-});
-
 // Expire old sessions and limiters periodically.
 setInterval(() => {
     const now = Date.now();
@@ -1225,7 +988,7 @@ setInterval(() => {
         }
     }
 
-    for (const store of [loginAttempts, messageAttempts, memberLookups, pollAttempts, voteAttempts]) {
+    for (const store of [loginAttempts, messageAttempts, memberLookups]) {
         for (const [key, entry] of store) {
             if (now >= entry.resetAt) {
                 store.delete(key);
@@ -1239,10 +1002,6 @@ setInterval(() => {
 
     removeOldDms().catch((error) => {
         console.error("DM cleanup failed:", error.message);
-    });
-
-    removeOldPolls().catch((error) => {
-        console.error("Poll cleanup failed:", error.message);
     });
 }, 60 * 1000).unref();
 
