@@ -75,18 +75,18 @@ if (!sideConfig.right.enabled) {
 // One Discord client per enabled side.
 const bots = {};
 
-// Temporary in-memory sessions. Sessions expire after 5 hours.
+// Temporary in-memory sessions. Sessions expire after 12 hours.
 const sessions = new Map();
 const loginAttempts = new Map();
 const messageAttempts = new Map();
 const memberLookups = new Map();
 
-const SESSION_DURATION = 5 * 60 * 60 * 1000;
+const SESSION_DURATION = 12 * 60 * 60 * 1000;
 const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
 
-// Direct messages are kept for 5 hours (change this to keep them longer or shorter).
-const DM_RETENTION_MS = 5 * 60 * 60 * 1000;
+// Direct messages are kept for 24 hours (change this to keep them longer or shorter).
+const DM_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DISCORD_ID_PATTERN = /^\d{17,20}$/;
 
 // Image upload settings.
@@ -167,10 +167,10 @@ app.use((req, res, next) => {
     next();
 });
 
-// Remove messages older than 30 minutes.
+// Remove messages older than five minutes.
 async function removeOldMessages() {
     const cutoff = new Date(
-        Date.now() - 30 * 60 * 1000
+        Date.now() - 5 * 60 * 1000
     ).toISOString();
 
     const { error } = await supabase
@@ -213,23 +213,26 @@ function inferImageContentType(url = "") {
     if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
     if (path.endsWith(".webp")) return "image/webp";
     if (path.endsWith(".avif")) return "image/avif";
+    if (path.endsWith(".mp4") || path.endsWith(".m4v")) return "video/mp4";
+    if (path.endsWith(".webm")) return "video/webm";
+    if (path.endsWith(".mov")) return "video/quicktime";
 
     return "image/*";
 }
 
-// Save Discord messages, including image attachments and GIF embeds.
+// Save Discord messages, including image and video attachments and GIF embeds.
 async function saveMessage(message) {
     if (message.channelId !== process.env.DISCORD_CHANNEL_ID) return;
     if (message.author.system) return;
 
     const attachments = Array.from(message.attachments.values())
         .filter((attachment) =>
-            attachment.contentType?.toLowerCase().startsWith("image/") ||
-            /\.(gif|png|jpe?g|webp|avif)(?:$|[?#])/i.test(attachment.url || "")
+            /^(image|video)\//i.test(attachment.contentType || "") ||
+            /\.(gif|png|jpe?g|webp|avif|mp4|m4v|webm|mov)(?:$|[?#])/i.test(attachment.url || "")
         )
         .map((attachment) => ({
             url: attachment.url,
-            name: attachment.name || "Image attachment",
+            name: attachment.name || "Attachment",
             contentType: attachment.contentType || inferImageContentType(attachment.url)
         }));
 
