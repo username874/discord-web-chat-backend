@@ -86,7 +86,7 @@ const MESSAGE_WINDOW = 60 * 1000;
 const MAX_MESSAGES_PER_WINDOW = 8;
 
 // Direct messages are kept for 24 hours (change this to keep them longer or shorter).
-const DM_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DM_RETENTION_MS = 5 * 60 * 60 * 1000;
 const DISCORD_ID_PATTERN = /^\d{17,20}$/;
 
 // Image upload settings.
@@ -170,7 +170,7 @@ app.use((req, res, next) => {
 // Remove messages older than five minutes.
 async function removeOldMessages() {
     const cutoff = new Date(
-        Date.now() - 5 * 60 * 1000
+        Date.now() - 60 * 60 * 1000
     ).toISOString();
 
     const { error } = await supabase
